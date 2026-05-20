@@ -40,7 +40,7 @@ from verl.experimental.agent_loop.utils import build_gpt_oss_tool_response_text
 from verl.interactions.base import BaseInteraction
 from verl.interactions.utils.interaction_registry import initialize_interactions_from_config
 from verl.tools.schemas import ToolResponse
-from verl.tools.utils.tool_registry import initialize_tools_from_config
+from verl.tools.tool_registry import initialize_tools_from_config
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.workers.rollout.replica import TokenOutput

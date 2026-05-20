@@ -44,7 +44,7 @@ from verl.experimental.agent_loop.agent_loop import (
 )
 from verl.experimental.agent_loop.rollout_session import get_or_create_proxy
 from verl.experimental.agent_loop.tool_parser import ToolParser
-from verl.tools.utils.tool_registry import initialize_tools_from_config
+from verl.tools.tool_registry import initialize_tools_from_config
 from verl.utils.chat_template import initialize_system_prompt
 
 logger = logging.getLogger(__file__)

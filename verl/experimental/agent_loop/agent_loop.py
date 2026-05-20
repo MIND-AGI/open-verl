@@ -58,12 +58,14 @@ from verl.utils.ray_utils import auto_await, get_event_loop
 from verl.utils.rollout_trace import (
     RolloutTraceConfig,
     rollout_trace_attr,
+    rollout_trace_op,
 )
 from verl.utils.tokenizer import normalize_token_ids
 from verl.workers.config import (
     HFModelConfig,
     RolloutConfig,
 )
+from verl.workers.rollout.replica import TokenOutput
 from verl.workers.rollout.llm_server import LLMServerClient
 
 logger = logging.getLogger(__file__)
