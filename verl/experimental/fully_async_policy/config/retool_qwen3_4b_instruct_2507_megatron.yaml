@@ -1,0 +1,133 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - fully_async_ppo_megatron_trainer
+  - _self_
+
+trainer:
+  nnodes: 1
+  n_gpus_per_node: 8
+  project_name: "fully-async-verl"
+  experiment_name: "retool-qwen3_4b_instruct_2507-megatron-fully_async_8_8"
+  default_local_dir: null
+  total_epochs: 10
+  test_freq: 10
+  save_freq: 20
+  val_before_train: True
+  resume_mode: auto
+  logger: ['console', 'wandb']
+  log_val_generations: 20
+
+async_training:
+  staleness_threshold: 0.5
+  trigger_parameter_sync_step: 4
+  require_batches: 1
+  partial_rollout: True
+
+rollout:
+  nnodes: 1
+  n_gpus_per_node: 8
+  total_rollout_steps: 128000
+
+data:
+  train_files: null
+  val_files: null
+  prompt_key: prompt
+  truncation: 'error'
+  max_prompt_length: 2048
+  max_response_length: 16384
+  train_batch_size: 0
+  gen_batch_size: 1
+  return_raw_chat: True
+  filter_overlong_prompts: True
+  custom_cls:
+    path: xrecipe/dataset/retool.py
+    name: ReToolDataset
+
+reward:
+  reward_manager:
+    name: rate_limited
+  custom_reward_function:
+    path: xrecipe/reward_score/math.py
+    name: compute_score
+  sandbox_fusion:
+    max_concurrent: 512
+
+algorithm:
+  adv_estimator: grpo
+  use_kl_in_reward: False
+  kl_ctrl:
+    kl_coef: 0.0
+
+actor_rollout_ref:
+  hybrid_engine: False
+  model:
+    path: null
+    use_remove_padding: True
+    enable_gradient_checkpointing: True
+  actor:
+    megatron:
+      use_mbridge: True
+      use_dist_checkpointing: False
+      param_offload: False
+      grad_offload: False
+      optimizer_offload: False
+      tensor_model_parallel_size: 4
+      pipeline_model_parallel_size: 1
+      virtual_pipeline_model_parallel_size: null
+      context_parallel_size: 2
+      override_transformer_config:
+        apply_rope_fusion: True
+        masked_softmax_fusion: True
+        bias_activation_fusion: True
+        bias_dropout_fusion: True
+        gradient_accumulation_fusion: True
+        deallocate_pipeline_outputs: True
+        persist_layer_norm: True
+    optim:
+      lr: 1e-6
+    use_kl_loss: False
+    kl_loss_coef: 0.0
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.28
+    clip_ratio_c: 10.0
+    use_dynamic_bsz: True
+    ppo_mini_batch_size: 16
+    ppo_max_token_len_per_gpu: 36864
+  ref:
+    megatron:
+      use_dist_checkpointing: False
+      param_offload: False
+      tensor_model_parallel_size: 4
+      pipeline_model_parallel_size: 1
+      virtual_pipeline_model_parallel_size: null
+      context_parallel_size: 2
+    log_prob_max_token_len_per_gpu: 73728  # 4 * (max_prompt_length + max_response_length)
+  rollout:
+    name: vllm
+    mode: async
+    tensor_model_parallel_size: 1
+    enable_chunked_prefill: True
+    max_num_batched_tokens: 10240
+    multi_turn:
+      enable: True
+      max_user_turns: 16
+      max_assistant_turns: 16
+      tool_config_path: xrecipe/config/sandbox_fusion_tool_config.yaml
+      format: hermes
+    gpu_memory_utilization: 0.85
+    n: 16
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+    calculate_log_probs: True
+    enforce_eager: True
+    free_cache_engine: True
+    val_kwargs:
+      temperature: 1.0
+      top_p: 0.6
+      top_k: -1
+      do_sample: True
+      n: 4

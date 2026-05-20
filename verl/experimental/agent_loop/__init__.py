@@ -17,12 +17,17 @@ from .agent_loop import (
     AgentLoopManager,
     AgentLoopOutput,
     AgentLoopWorker,
+    AsyncLLMServerManager,
+    PerTurnAgentLoopManager,
+    PerTurnAgentLoopWorker,
     get_trajectory_info,
 )
+from .external_per_turn_tool_agent_loop import ExternalPerTurnToolAgentLoop
+from .per_turn_tool_agent_loop import PerTurnToolAgentLoop
 from .single_turn_agent_loop import SingleTurnAgentLoop
 from .tool_agent_loop import ToolAgentLoop
 
-_ = [SingleTurnAgentLoop, ToolAgentLoop]
+_ = [SingleTurnAgentLoop, ToolAgentLoop, PerTurnToolAgentLoop, ExternalPerTurnToolAgentLoop, ]
 
 __all__ = [
     "AgentLoopBase",
@@ -30,4 +35,7 @@ __all__ = [
     "AgentLoopWorker",
     "AgentLoopOutput",
     "get_trajectory_info",
+    "AsyncLLMServerManager",
+    "PerTurnAgentLoopManager",
+    "PerTurnAgentLoopWorker",
 ]

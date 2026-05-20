@@ -1061,3 +1061,418 @@ class AgentLoopManager:
             timing["agent_loop/slowest/response_length"] = attention_mask[prompt_length:].sum().item()
 
         return timing
+
+
+class AsyncLLMServerManager:
+    """
+    A class to manage multiple OpenAI compatible LLM servers. This class provides
+    - Load balance: least in-flight requests load balancing via global coordination
+    - Sticky session: send multi-turn chat completions to same server for automatic prefix caching
+    """
+
+    def __init__(
+        self,
+        config: DictConfig,
+        servers: list[tuple[str, ray.actor.ActorHandle]],
+        load_balancer_handle: ray.actor.ActorHandle,
+    ):
+        """Initialize the AsyncLLMServerManager.
+
+        Args:
+            config (DictConfig): whole config for main entrypoint.
+            servers (list[tuple[str, ray.actor.ActorHandle]]): (address, handle) pairs for each LLM server.
+            load_balancer_handle (ray.actor.ActorHandle): shared global load balancer actor.
+        """
+        self.config = config
+        self._load_balancer = load_balancer_handle
+        self._server_id_to_handle: dict[str, ray.actor.ActorHandle] = dict(servers)
+
+    async def _acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHandle]:
+        server_id = await self._load_balancer.acquire_server.remote(request_id=request_id)
+        handle = self._server_id_to_handle.get(server_id)
+        if handle is None:
+            raise RuntimeError(f"Unknown server_id returned by load balancer: {server_id}")
+        return server_id, handle
+
+    def _release_server(self, server_id: str) -> None:
+        # Fire-and-forget: release is just a counter decrement, no need to await.
+        # Awaiting here risks blocking the finally clause if the LB actor is unresponsive.
+        self._load_balancer.release_server.remote(server_id=server_id)
+
+    @rollout_trace_op
+    async def generate(
+        self,
+        request_id,
+        *,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+        image_data: Optional[list[Any]] = None,
+        video_data: Optional[list[Any]] = None,
+    ) -> TokenOutput:
+        """Generate tokens from prompt ids.
+
+        Args:
+            request_id (str): request id for sticky session.
+            prompt_ids (List[int]): List of prompt token ids.
+            sampling_params (Dict[str, Any]): Sampling parameters for the chat completion.
+
+        Returns:
+            TokenOutput: token output
+        """
+        server_id, server = await self._acquire_server(request_id)
+        try:
+            output: TokenOutput = await server.generate.remote(
+                request_id=uuid4().hex,  # use new request_id for each turn
+                prompt_ids=prompt_ids,
+                sampling_params=sampling_params,
+                image_data=image_data,
+                video_data=video_data,
+            )
+            return output
+        finally:
+            self._release_server(server_id)
+
+class PerTurnAgentLoopManager(AgentLoopManager):
+    """Agent loop manager for per-turn training.
+
+    Uses ``PerTurnAgentLoopWorker`` which handles agent loops that return
+    ``list[AgentLoopOutput]`` (one per assistant turn).
+    """
+
+    def __init__(self, *args, **kwargs):
+        if not hasattr(self, "agent_loop_workers_class"):
+            self.agent_loop_workers_class = ray.remote(PerTurnAgentLoopWorker)
+        super().__init__(*args, **kwargs)
+
+    def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:
+        """Compute performance metrics, filtering by turn_id == 0 for per-sample stats."""
+        timing = {}
+        flat_metrics = [metric for chunk in metrics for metric in chunk]
+
+        # Filter to first-turn rows for per-sample metrics
+        turn_ids = output.non_tensor_batch.get("turn_id")
+        if turn_ids is not None:
+            sample_row_indices = np.flatnonzero(turn_ids == 0)
+            sample_metrics = [flat_metrics[idx] for idx in sample_row_indices.tolist()]
+        else:
+            sample_metrics = flat_metrics
+
+        t_generate_sequences = np.array([m["generate_sequences"] for m in sample_metrics])
+        t_tool_calls = np.array([m["tool_calls"] for m in sample_metrics])
+        num_preempted = np.array([m["num_preempted"] for m in sample_metrics])
+
+        timing["agent_loop/num_preempted/min"] = num_preempted.min()
+        timing["agent_loop/num_preempted/max"] = num_preempted.max()
+        timing["agent_loop/num_preempted/mean"] = num_preempted.mean()
+        timing["agent_loop/generate_sequences/min"] = t_generate_sequences.min()
+        timing["agent_loop/generate_sequences/max"] = t_generate_sequences.max()
+        timing["agent_loop/generate_sequences/mean"] = t_generate_sequences.mean()
+        timing["agent_loop/tool_calls/min"] = t_tool_calls.min()
+        timing["agent_loop/tool_calls/max"] = t_tool_calls.max()
+        timing["agent_loop/tool_calls/mean"] = t_tool_calls.mean()
+
+        slowest = np.argmax(t_generate_sequences + t_tool_calls)
+        timing["agent_loop/slowest/generate_sequences"] = t_generate_sequences[slowest]
+        timing["agent_loop/slowest/tool_calls"] = t_tool_calls[slowest]
+        timing["agent_loop/slowest/num_preempted"] = num_preempted[slowest]
+
+        # Map sample-space slowest index to row-space for attention_mask lookup
+        num_rows = len(output.batch["attention_mask"])
+        if num_rows > 0 and turn_ids is not None:
+            starts = np.flatnonzero(turn_ids == 0)
+            row_start = starts[slowest]
+            row_end = starts[slowest + 1] if slowest + 1 < len(starts) else num_rows
+            sample_attention_mask = output.batch["attention_mask"][row_start:row_end]
+            prompt_length = output.batch["prompts"].shape[1]
+            prompt_lengths = sample_attention_mask[:, :prompt_length].sum(dim=1).float()
+            response_lengths = sample_attention_mask[:, prompt_length:].sum(dim=1).float()
+            timing["agent_loop/slowest/prompt_length"] = prompt_lengths.mean().item()
+            timing["agent_loop/slowest/response_length"] = response_lengths.mean().item()
+            timing["agent_loop/slowest/num_turns"] = row_end - row_start
+        elif num_rows > 0:
+            attention_mask = output.batch["attention_mask"][slowest]
+            prompt_length = output.batch["prompts"].shape[1]
+            timing["agent_loop/slowest/prompt_length"] = attention_mask[:prompt_length].sum().item()
+            timing["agent_loop/slowest/response_length"] = attention_mask[prompt_length:].sum().item()
+
+        # Stop reason ratios (use per-sample rows only, not per-turn duplicates)
+        terminated_reasons = output.non_tensor_batch.get("terminated_reason")
+        if terminated_reasons is not None:
+            if turn_ids is not None:
+                sample_indices = np.flatnonzero(turn_ids == 0)
+                terminated_reasons = terminated_reasons[sample_indices]
+            total = len(terminated_reasons)
+            if total > 0:
+                unique, counts = np.unique(terminated_reasons, return_counts=True)
+                for reason, count in zip(unique, counts):
+                    timing[f"agent_loop/terminated_reason/{reason}"] = count / total
+
+        return timing
+
+class PerTurnAgentLoopWorker(AgentLoopWorker):
+    """Agent loop worker that handles per-turn agent loops returning
+    ``list[AgentLoopOutput]`` instead of a single ``AgentLoopOutput``.
+
+    Each assistant turn becomes a separate training row with its own
+    prompt/response pair. The tool/interaction response tokens appear only in
+    the *next* turn's prompt, not in any turn's response.
+    """
+
+    async def _run_agent_loop(
+        self,
+        sampling_params: dict[str, Any],
+        trajectory: dict[str, Any],
+        *,
+        agent_name: str,
+        trace: bool = True,
+        **kwargs,
+    ) -> list[_InternalAgentLoopOutput]:
+        with rollout_trace_attr(
+            step=trajectory["step"],
+            sample_index=trajectory["sample_index"],
+            rollout_n=trajectory["rollout_n"],
+            validate=trajectory["validate"],
+            name="agent_loop",
+            trace=trace,
+        ):
+            assert agent_name in _agent_loop_registry, (
+                f"Agent loop {agent_name} not registered, registered agent loops: {_agent_loop_registry.keys()}"
+            )
+
+            agent_loop_config = _agent_loop_registry[agent_name]
+            agent_loop = hydra.utils.instantiate(
+                config=agent_loop_config,
+                trainer_config=DictConfigWrap(config=self.config),
+                server_manager=self.server_manager,
+                tokenizer=self.tokenizer,
+                processor=self.processor,
+                dataset_cls=self.dataset_cls,
+                data_config=DictConfigWrap(self.config.data),
+            )
+            result = await agent_loop.run(sampling_params, **kwargs)
+            # agent_loop.run() should return list[AgentLoopOutput] for per-turn loops.
+            # Guard against unexpected return types (e.g., single AgentLoopOutput).
+            if isinstance(result, AgentLoopOutput):
+                result = [result]
+            outputs: list[AgentLoopOutput] = result
+            return await self._per_turn_postprocess(outputs, trajectory["validate"], **kwargs)
+
+    async def _per_turn_postprocess(
+        self, outputs: list[AgentLoopOutput], validate: bool, **kwargs
+    ) -> list[_InternalAgentLoopOutput]:
+        """Post-process a list of per-turn outputs, padding each individually.
+
+        Reward is computed only on the last turn; earlier turns get
+        ``reward_score = 0.0`` which is then overwritten with the broadcast
+        advantage during training.
+        """
+        processed: list[_InternalAgentLoopOutput] = []
+        for output_idx, output in enumerate(outputs):
+            output.extra_fields["raw_prompt"] = kwargs.get("raw_prompt")
+
+            self.tokenizer.padding_side = "left"
+            prompt_output = self.tokenizer.pad(
+                {"input_ids": output.prompt_ids},
+                padding="max_length",
+                max_length=self.rollout_config.prompt_length,
+                return_tensors="pt",
+                return_attention_mask=True,
+            )
+            if prompt_output["input_ids"].dim() == 1:
+                prompt_output["input_ids"] = prompt_output["input_ids"].unsqueeze(0)
+                prompt_output["attention_mask"] = prompt_output["attention_mask"].unsqueeze(0)
+
+            self.tokenizer.padding_side = "right"
+            response_output = self.tokenizer.pad(
+                {"input_ids": output.response_ids},
+                padding="max_length",
+                max_length=self.rollout_config.response_length,
+                return_tensors="pt",
+                return_attention_mask=True,
+            )
+            if response_output["input_ids"].dim() == 1:
+                response_output["input_ids"] = response_output["input_ids"].unsqueeze(0)
+                response_output["attention_mask"] = response_output["attention_mask"].unsqueeze(0)
+
+            response_mask_output = self.tokenizer.pad(
+                {"input_ids": output.response_mask},
+                padding="max_length",
+                max_length=self.rollout_config.response_length,
+                return_tensors="pt",
+                return_attention_mask=False,
+            )
+            if response_mask_output["input_ids"].dim() == 1:
+                response_mask_output["input_ids"] = response_mask_output["input_ids"].unsqueeze(0)
+
+            response_logprobs = None
+            if output.response_logprobs is not None:
+                pad_size = self.rollout_config.response_length - len(output.response_logprobs)
+                response_logprobs = torch.tensor(output.response_logprobs + [0.0] * pad_size).unsqueeze(0)
+
+            response_mask = response_mask_output["input_ids"] * response_output["attention_mask"]
+            attention_mask = torch.cat([prompt_output["attention_mask"], response_output["attention_mask"]], dim=1)
+            input_ids = torch.cat([prompt_output["input_ids"], response_output["input_ids"]], dim=1)
+
+            routed_experts = None
+            if output.routed_experts is not None:
+                total_length = input_ids.shape[1]
+                length, layer_num, topk_num = output.routed_experts.shape
+                if isinstance(output.routed_experts, np.ndarray):
+                    routed_experts_array = output.routed_experts
+                    if not routed_experts_array.flags.writeable:
+                        routed_experts_array = routed_experts_array.copy()
+                    experts_tensor = torch.from_numpy(routed_experts_array)
+                elif isinstance(output.routed_experts, torch.Tensor):
+                    experts_tensor = output.routed_experts
+                else:
+                    raise TypeError(f"Unsupported type for routed_experts: {type(output.routed_experts)}")
+                routed_experts = torch.zeros(1, total_length, layer_num, topk_num, dtype=experts_tensor.dtype)
+                start_pos = prompt_output["input_ids"].shape[1] - len(output.prompt_ids)
+                end_pos = min(start_pos + length, total_length)
+                if start_pos < 0 or end_pos > total_length:
+                    raise ValueError(
+                        f"Invalid position range: start_pos={start_pos}, end_pos={end_pos}, total_length={total_length}"
+                    )
+                routed_experts[:, start_pos:end_pos] = experts_tensor.unsqueeze(0)
+
+            multi_modal_inputs = self._compute_multi_modal_inputs(output, input_ids)
+            position_ids = self._compute_position_ids(input_ids, attention_mask, multi_modal_inputs)
+
+            # Compute reward score only on the last turn
+            if output_idx == len(outputs) - 1:
+                await self._compute_score(
+                    output,
+                    prompts=prompt_output["input_ids"],
+                    responses=response_output["input_ids"],
+                    attention_mask=attention_mask,
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    kwargs=kwargs,
+                )
+            else:
+                output.reward_score = 0.0
+                output.extra_fields.setdefault("reward_extra_info", {})
+
+            processed.append(
+                _InternalAgentLoopOutput(
+                    prompt_ids=prompt_output["input_ids"],
+                    response_ids=response_output["input_ids"],
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    response_mask=response_mask,
+                    attention_mask=attention_mask,
+                    response_logprobs=response_logprobs,
+                    routed_experts=routed_experts,
+                    multi_modal_inputs=multi_modal_inputs,
+                    multi_modal_data=output.multi_modal_data,
+                    reward_score=output.reward_score,
+                    num_turns=output.num_turns,
+                    metrics=output.metrics,
+                    extra_fields=output.extra_fields,
+                )
+            )
+
+        # Broadcast last turn's reward to all turns
+        for output in processed[:-1]:
+            output.reward_score = processed[-1].reward_score
+            output.extra_fields["reward_extra_info"] = processed[-1].extra_fields.get("reward_extra_info", {})
+
+        return processed
+
+    def _postprocess(
+        self,
+        inputs: list[list[_InternalAgentLoopOutput]],
+        input_non_tensor_batch: dict | None = None,
+        validate: bool = False,
+    ) -> DataProto:
+        """Flatten per-turn outputs and combine into a batch with turn_id tracking."""
+        # Compute turn_id for each row
+        turn_ids = np.array([turn_id for sample in inputs for turn_id, _ in enumerate(sample)], dtype=np.int32)
+        # Flatten the nested list
+        flat_inputs = [turn for sample in inputs for turn in sample]
+
+        prompt_ids = torch.cat([inp.prompt_ids for inp in flat_inputs], dim=0)
+        response_ids = torch.cat([inp.response_ids for inp in flat_inputs], dim=0)
+        response_mask = torch.cat([inp.response_mask for inp in flat_inputs], dim=0)
+        attention_mask = torch.cat([inp.attention_mask for inp in flat_inputs], dim=0)
+        input_ids = torch.cat([inp.input_ids for inp in flat_inputs], dim=0)
+        position_ids = torch.cat([inp.position_ids for inp in flat_inputs], dim=0)
+
+        optional_outputs = {}
+        if flat_inputs[0].response_logprobs is not None:
+            optional_outputs["rollout_log_probs"] = torch.cat(
+                [inp.response_logprobs for inp in flat_inputs], dim=0
+            )
+        if flat_inputs[0].routed_experts is not None:
+            optional_outputs["routed_experts"] = torch.cat(
+                [inp.routed_experts for inp in flat_inputs], dim=0
+            )
+
+        batch = TensorDict(
+            {
+                "prompts": prompt_ids,
+                "responses": response_ids,
+                "response_mask": response_mask,
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+                **optional_outputs,
+            },
+            batch_size=len(flat_inputs),
+        )
+
+        scores = [inp.reward_score for inp in flat_inputs]
+        if all(score is not None for score in scores):
+            prompt_length = prompt_ids.size(1)
+            response_length = attention_mask[:, prompt_length:].sum(dim=1) - 1
+            rm_scores = torch.zeros_like(response_mask, dtype=torch.float32)
+            rm_scores[torch.arange(response_mask.size(0)), response_length] = torch.tensor(
+                scores, dtype=torch.float32
+            )
+            batch["rm_scores"] = rm_scores
+
+        non_tensor_batch = {
+            "__num_turns__": np.array([inp.num_turns for inp in flat_inputs], dtype=np.int32),
+            "__num_tool_turns__": np.array([inp.metrics.num_tool_turns for inp in flat_inputs], dtype=np.int32),
+            "__num_assistant_turns__": np.array([inp.metrics.num_assistant_turns for inp in flat_inputs], dtype=np.int32),
+            "__num_interaction_turns__": np.array([inp.metrics.num_interaction_turns for inp in flat_inputs], dtype=np.int32),
+            "turn_id": turn_ids,
+        }
+        if self.reward_loop_worker_handles is None and input_non_tensor_batch:
+            # Replicate per-sample non_tensor_batch entries to match the flattened turn count
+            for key, values in input_non_tensor_batch.items():
+                expanded = []
+                for sample_idx, turns in enumerate(inputs):
+                    for _ in turns:
+                        expanded.append(values[sample_idx])
+                non_tensor_batch[key] = np.array(expanded, dtype=object)
+
+        # Reward extra info
+        reward_extra_infos = [inp.extra_fields.get("reward_extra_info", {}) for inp in flat_inputs]
+        reward_extra_keys = list(reward_extra_infos[0].keys()) if reward_extra_infos else []
+        for key in reward_extra_keys:
+            non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
+
+        # Multi-modal inputs
+        multi_modal_inputs_list = [inp.multi_modal_inputs for inp in flat_inputs]
+        if any(mmi is not None for mmi in multi_modal_inputs_list):
+            non_tensor_batch["multi_modal_inputs"] = np.array(multi_modal_inputs_list, dtype=object)
+
+        metrics = [inp.metrics.model_dump() if hasattr(inp.metrics, "model_dump") else inp.metrics for inp in flat_inputs]
+
+        # Extra fields
+        default_extra_keys = {"turn_scores", "tool_rewards", "min_global_steps", "max_global_steps", "extras"}
+        all_keys = set(key for inp in flat_inputs for key in inp.extra_fields) | default_extra_keys
+        extra_fields = {}
+        for key in all_keys:
+            temp_arr = np.empty(len(flat_inputs), dtype=object)
+            temp_arr[:] = [inp.extra_fields.get(key) for inp in flat_inputs]
+            extra_fields[key] = temp_arr
+        non_tensor_batch.update(extra_fields)
+
+        if "rm_scores" in batch.keys():
+            meta_info = {"metrics": metrics, "reward_extra_keys": reward_extra_keys}
+        else:
+            meta_info = {"metrics": metrics}
+
+        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info=meta_info)
