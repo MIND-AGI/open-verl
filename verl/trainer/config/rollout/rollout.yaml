@@ -248,6 +248,9 @@ agent:
   #   max_terms: 6
   agent_loop_config_path: null
 
+  # Fully qualified class name for a custom AgentLoopManager implementation.
+  agent_loop_manager_class: null
+
   # custom async server configs
   custom_async_server:
 
