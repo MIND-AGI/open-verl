@@ -1,4 +1,10 @@
 env_vars:
   VLLM_USE_V1: "1"
-  NCCL_DEBUG: "INFO"
+  NCCL_DEBUG: "WARN"
+  NCCL_CUMEM_ENABLE: "0"
+  NCCL_CUMEM_HOST_ENABLE: "0"
   HYDRA_FULL_ERROR: "1"
+  HOME: "/mnt/nfs/smzhang"
+  VLLM_CACHE_ROOT: "/mnt/nfs/smzhang/.cache/vllm"
+  VLLM_CONFIG_ROOT: "/mnt/nfs/smzhang/.cache/vllm_config"
+  VLLM_NO_USAGE_STATS: "1"

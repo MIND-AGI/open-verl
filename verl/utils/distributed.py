@@ -19,6 +19,7 @@ import socket
 from datetime import timedelta
 
 import ray
+import torch
 import torch.distributed
 
 from verl.utils.device import get_device_name, get_nccl_backend, get_torch_device, is_npu_available
@@ -132,13 +133,15 @@ def stateless_init_process_group(master_address, master_port, rank, world_size, 
         Modified to support ipv6 stateless communication groups."""
         launch_server = rank == 0
         if launch_server:
-            # listen on the specified interface (instead of 0.0.0.0)
+            # Listen on all interfaces; clients connect via master_address (node IP).
             if is_ipv6(master_address):
                 listen_socket = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+                bind_addr = ("::", port)
             else:
                 listen_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                bind_addr = ("0.0.0.0", port)
             listen_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            listen_socket.bind((host, port))
+            listen_socket.bind(bind_addr)
             listen_socket.listen()
             listen_fd = listen_socket.fileno()
         else:
@@ -165,5 +168,8 @@ def stateless_init_process_group(master_address, master_port, rank, world_size, 
 
     pg = create_process_group(host=master_address, port=master_port, rank=rank, world_size=world_size)
 
+    if isinstance(device, torch.device):
+        device = device.index
+    get_torch_device().set_device(device)
     pynccl = PyNcclCommunicator(pg, device=device)
     return pynccl

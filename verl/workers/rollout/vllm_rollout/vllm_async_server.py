@@ -55,6 +55,28 @@ from verl.workers.rollout.vllm_rollout.utils import (
 
 _VLLM_VERSION = version.parse(vllm.__version__)
 
+
+def _rollout_server_runtime_env_vars() -> dict[str, str]:
+    """Writable NFS paths for Ray vLLM servers on compute nodes without login $HOME."""
+    home = os.environ.get("HOME") or os.environ.get("RL_MOE_HOME", "/mnt/nfs/smzhang")
+    cache_root = os.environ.get("RL_MOE_CACHE_ROOT", "/mnt/nfs/smzhang/.cache")
+    vllm_cache = os.environ.get("VLLM_CACHE_ROOT", f"{cache_root}/vllm")
+    vllm_config = os.environ.get("VLLM_CONFIG_ROOT", f"{cache_root}/vllm_config")
+    return {
+        "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES": "1",
+        # vLLM server actors are zero-GPU Ray actors that intentionally reuse
+        # the colocated worker GPUs via CUDA_VISIBLE_DEVICES. Ray 2.55 clears
+        # CUDA_VISIBLE_DEVICES for zero-GPU actors unless this opt-out is set.
+        "RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO": "0",
+        "NCCL_CUMEM_ENABLE": "0",
+        "HOME": home,
+        "XDG_CACHE_HOME": os.environ.get("XDG_CACHE_HOME", f"{cache_root}/xdg"),
+        "VLLM_CACHE_ROOT": vllm_cache,
+        "VLLM_CONFIG_ROOT": vllm_config,
+        "VLLM_NO_USAGE_STATS": os.environ.get("VLLM_NO_USAGE_STATS", "1"),
+    }
+
+
 if _VLLM_VERSION > version.parse("0.11.0"):
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
@@ -107,7 +129,15 @@ class vLLMHttpServer:
             nnodes (int): number of nodes.
             cuda_visible_devices (str): cuda visible devices.
         """
-        os.environ[get_visible_devices_keyword()] = cuda_visible_devices
+        visible_devices_key = get_visible_devices_keyword()
+        existing_visible_devices = os.environ.get(visible_devices_key)
+        if existing_visible_devices is None:
+            os.environ[visible_devices_key] = cuda_visible_devices
+        elif existing_visible_devices != cuda_visible_devices:
+            raise RuntimeError(
+                f"{visible_devices_key} must be set by Ray runtime_env before importing vLLM; "
+                f"got {existing_visible_devices!r}, expected {cuda_visible_devices!r}."
+            )
         os.environ["VERL_REPLICA_RANK"] = str(replica_rank)
         # Forward the Ray job id into the vLLM worker subprocess so the
         # colocated weight-transfer IPC socket path is unique per Ray job.
@@ -931,7 +961,7 @@ class vLLMReplica(RolloutReplica):
                 for worker in self.workers
             ]
         )
-        worker_cuda_visible_devices = [worker_info[1] for worker_info in worker_infos]
+        worker_cuda_visible_devices = [str(worker_info[1]) for worker_info in worker_infos]
         worker_node_ids = [worker_info[0] for worker_info in worker_infos]
 
         # create server actor in each node with node affinity and cuda visible devices
@@ -949,22 +979,14 @@ class vLLMReplica(RolloutReplica):
                 name = f"{prefix}server_teacher_{self.replica_rank}_{node_rank}{self.name_suffix}"
             else:
                 name = f"{prefix}server_{self.replica_rank}_{node_rank}{self.name_suffix}"
+            server_env_vars = _rollout_server_runtime_env_vars()
+            server_env_vars[get_visible_devices_keyword()] = node_cuda_visible_devices
             server = self.server_class.options(
                 scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                     node_id=node_id,
                     soft=False,
                 ),
-                runtime_env={
-                    "env_vars": {
-                        "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
-                        "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES": "1",
-                        # To prevent hanging or crash during synchronization of weights between actor and rollout
-                        # in disaggregated mode. See:
-                        # https://docs.vllm.ai/en/latest/usage/troubleshooting.html?h=nccl_cumem_enable#known-issues
-                        # https://github.com/vllm-project/vllm/blob/c6b0a7d3ba03ca414be1174e9bd86a97191b7090/vllm/worker/worker_base.py#L445
-                        "NCCL_CUMEM_ENABLE": "0",
-                    }
-                },
+                runtime_env={"env_vars": server_env_vars},
                 name=name,
                 max_concurrency=self.max_concurrency,
             ).remote(

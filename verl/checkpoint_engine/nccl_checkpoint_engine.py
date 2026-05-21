@@ -12,18 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import contextlib
 import logging
 import os
 import time
 from dataclasses import dataclass
 from typing import AsyncGenerator, Generator
-from unittest.mock import patch
-
-with patch("importlib.metadata.distributions", return_value=[]):
-    import cupy as cp
 
 import ray
-import ray.util.collective as collective
 import torch
 import zmq
 
@@ -34,16 +30,53 @@ from verl.checkpoint_engine.base import (
     merge_weight_chunks,
     split_weight_chunks,
 )
+from verl.utils.distributed import stateless_init_process_group
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+@contextlib.contextmanager
+def _checkpoint_nccl_env():
+    """Use a lightweight NCCL config for the auxiliary checkpoint communicator.
+
+    Megatron/vLLM workers already hold large NCCL communicators with many IB memory
+    registrations.  Creating another 25-rank IB/GDR comm in the same process often
+    fails with ``ibv_reg_mr_iova2: Cannot allocate memory``.
+    """
+    # Respect explicit user overrides (e.g. from run script / Ray runtime_env).
+    defaults = {
+        "NCCL_NVLS_ENABLE": "0",
+        "NCCL_NET_GDR_LEVEL": "0",
+        "NCCL_IB_GDR_LEVEL": "0",
+        "NCCL_NCHANNELS": "1",
+        "NCCL_MIN_NCHANNELS": "1",
+        "NCCL_MAX_NCHANNELS": "1",
+        "NCCL_P2P_DISABLE": "1",
+        "NCCL_SHM_DISABLE": "1",
+    }
+    saved: dict[str, str | None] = {}
+    for key, value in defaults.items():
+        saved[key] = os.environ.get(key)
+        if saved[key] is None:
+            os.environ[key] = value
+    try:
+        yield
+    finally:
+        for key, old in saved.items():
+            if old is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old
+
+
 @dataclass
 class MasterMetadata:
     zmq_ip: str
     zmq_port: int
+    dist_ip: str
+    dist_port: int
 
 
 class BroadcastOperation:
@@ -51,8 +84,8 @@ class BroadcastOperation:
 
     Args:
         rank (int): The rank of the current process.
-        group_name (str): The name of the NCCL process group.
-        bucket (cp.ndarray | torch.Tensor): The tensor to broadcast.
+        pynccl: The PyNccl communicator for this checkpoint group.
+        bucket (torch.Tensor): The tensor to broadcast.
         metadata (dict[str, TensorMeta]): The metadata of the tensor.
         socket (zmq.Socket): The zeromq socket to communicate with master.
         topic (str): The topic to subscribe.
@@ -61,14 +94,14 @@ class BroadcastOperation:
     def __init__(
         self,
         rank: int,
-        group_name: str,
-        bucket: cp.ndarray | torch.Tensor,
+        pynccl,
+        bucket: torch.Tensor,
         metadata: dict[str, TensorMeta],
         socket: zmq.Socket,
         topic: str,
     ) -> None:
         self.rank = rank
-        self.group_name = group_name
+        self.pynccl = pynccl
         self.bucket = bucket
         self.metadata = metadata
         self.socket = socket
@@ -87,7 +120,8 @@ class BroadcastOperation:
             self.metadata = self.socket.recv_pyobj()
 
         # broadcast tensor via NCCL
-        collective.broadcast(self.bucket, src_rank=0, group_name=self.group_name)
+        self.pynccl.broadcast(self.bucket, src=0)
+        torch.cuda.synchronize()
 
     async def wait_for_complete(self) -> dict[str, TensorMeta]:
         """Wait for the broadcast operation to complete.
@@ -103,10 +137,14 @@ class BroadcastOperation:
 class NCCLCheckpointEngine(CheckpointEngine):
     """NCCL checkpoint engine with collective communication.
 
+    Uses vLLM's stateless PyNccl communicator instead of Ray collective so
+    weight sync works when ``RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1``
+    and each worker binds to a different physical GPU.
+
     Args:
         bucket_size (int): Bucket size in bytes to transfer multiple weights at one time. Note that we use
             two buffer to send and recv weights at same time, so the device memory overhead is 2 * bucket_size.
-        group_name (str): The name of the NCCL process group. Defaults to "default".
+        group_name (str): Unused legacy argument kept for config compatibility.
         rebuild_group (bool): Whether to rebuild the NCCL process group in each update. Defaults to False.
         is_master (bool): Whether the current process is the master process. Defaults to False.
         rollout_dtype (torch.dtype): The dtype of the weights received from rollout workers. Defaults to torch.bfloat16.
@@ -124,6 +162,10 @@ class NCCLCheckpointEngine(CheckpointEngine):
         self.group_name = group_name
         self.rebuild_group = rebuild_group
         self.rollout_dtype = rollout_dtype
+        self.pynccl = None
+        self.rank = None
+        self.world_size = None
+        self.device = None
 
         # start zeromq server for broadcasting bucket tensor metadata
         self.is_master = is_master
@@ -131,23 +173,36 @@ class NCCLCheckpointEngine(CheckpointEngine):
         if self.is_master:
             self._start_zmq_server()
 
-    def prepare(self) -> MasterMetadata:
-        # For master process, use cupy instead of torch to avoid memory register error
-        # when `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
-        if self.is_master:
-            self.send_buf = cp.zeros(self.bucket_size, dtype=cp.uint8)
-            self.recv_buf = cp.zeros(self.bucket_size, dtype=cp.uint8)
-        else:
-            self.send_buf = torch.zeros(self.bucket_size, dtype=torch.uint8, device="cuda")
-            self.recv_buf = torch.zeros(self.bucket_size, dtype=torch.uint8, device="cuda")
+    @staticmethod
+    def _cuda_device() -> torch.device:
+        return torch.device("cuda", torch.cuda.current_device())
 
-        return MasterMetadata(zmq_ip=self.ip, zmq_port=self.listen_port) if self.is_master else None
+    def _destroy_pynccl(self) -> None:
+        if self.pynccl is None or self.pynccl.disabled:
+            return
+        self.pynccl.nccl.ncclCommDestroy(self.pynccl.comm)
+        self.pynccl.disabled = True
+        self.pynccl = None
+
+    def prepare(self) -> MasterMetadata:
+        self.device = self._cuda_device()
+        self.send_buf = torch.zeros(self.bucket_size, dtype=torch.uint8, device=self.device)
+        self.recv_buf = torch.zeros(self.bucket_size, dtype=torch.uint8, device=self.device)
+
+        if self.is_master:
+            return MasterMetadata(
+                zmq_ip=self.ip,
+                zmq_port=self.listen_port,
+                dist_ip=self.ip,
+                dist_port=self.dist_port,
+            )
+        return None
 
     def finalize(self):
         """Destroy the NCCL process group if rebuild_group is True."""
         if self.rebuild_group:
-            if self.rank >= 0:
-                collective.destroy_collective_group(self.group_name)
+            if self.rank is not None and self.rank >= 0:
+                self._destroy_pynccl()
             self.rank = None
             self.world_size = None
 
@@ -173,6 +228,7 @@ class NCCLCheckpointEngine(CheckpointEngine):
     def _start_zmq_server(self):
         self.ip = ray.util.get_node_ip_address().strip("[]")
         self.listen_port, _ = get_free_port(self.ip)
+        self.dist_port, _ = get_free_port(self.ip)
 
         context = zmq.Context()
         self.socket = context.socket(zmq.PUB)
@@ -210,8 +266,25 @@ class NCCLCheckpointEngine(CheckpointEngine):
             self.world_size = world_size
             return
 
-        if self.rebuild_group or not collective.is_group_initialized(self.group_name):
-            collective.init_collective_group(world_size, rank, "nccl", self.group_name)
+        device = self.device if self.device is not None else self._cuda_device()
+        if isinstance(device, torch.device):
+            device_idx = device.index
+        else:
+            device_idx = int(device)
+        torch.cuda.set_device(device_idx)
+
+        if self.rebuild_group and self.pynccl is not None:
+            self._destroy_pynccl()
+
+        if self.rebuild_group or self.pynccl is None:
+            with _checkpoint_nccl_env():
+                self.pynccl = stateless_init_process_group(
+                    master_metadata.dist_ip,
+                    master_metadata.dist_port,
+                    rank,
+                    world_size,
+                    device_idx,
+                )
             self.rank = rank
             self.world_size = world_size
         else:
@@ -222,7 +295,6 @@ class NCCLCheckpointEngine(CheckpointEngine):
 
         if self.rank > 0:
             self._connect_zmq_client(master_metadata)
-        collective.barrier(self.group_name)
 
         logger.info(f"init_process_group rank: {self.rank}, world_size: {self.world_size}")
 
@@ -258,7 +330,7 @@ class NCCLCheckpointEngine(CheckpointEngine):
 
                 broadcast_op = BroadcastOperation(
                     rank=self.rank,
-                    group_name=self.group_name,
+                    pynccl=self.pynccl,
                     bucket=send_buf,
                     metadata={"bucket_meta": bucket_meta, "is_last": False},
                     socket=self.socket,
@@ -275,7 +347,7 @@ class NCCLCheckpointEngine(CheckpointEngine):
 
             tensor_meta.offset = offset
             bucket_meta[tensor_meta.name] = tensor_meta
-            send_buf[offset : offset + tensor_meta.chunk_size] = cp.asarray(chunk)
+            send_buf[offset : offset + tensor_meta.chunk_size].copy_(chunk.view(-1).to(dtype=torch.uint8))
             offset += tensor_meta.chunk_size
 
         # broadcast last bucket
@@ -285,7 +357,7 @@ class NCCLCheckpointEngine(CheckpointEngine):
 
         broadcast_op = BroadcastOperation(
             rank=self.rank,
-            group_name=self.group_name,
+            pynccl=self.pynccl,
             bucket=send_buf,
             metadata={"bucket_meta": bucket_meta, "is_last": True},
             socket=self.socket,
@@ -318,7 +390,7 @@ class NCCLCheckpointEngine(CheckpointEngine):
         start_time = time.time()
         broadcast_op = BroadcastOperation(
             rank=self.rank,
-            group_name=self.group_name,
+            pynccl=self.pynccl,
             bucket=recv_buf,
             metadata=None,
             socket=self.socket,
@@ -334,7 +406,7 @@ class NCCLCheckpointEngine(CheckpointEngine):
             # 1. receive next bucket
             broadcast_op = BroadcastOperation(
                 rank=self.rank,
-                group_name=self.group_name,
+                pynccl=self.pynccl,
                 bucket=recv_buf,
                 metadata=None,
                 socket=self.socket,

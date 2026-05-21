@@ -199,10 +199,14 @@ class RolloutReplica(ABC):
         resource_pool_spec = {
             resource_pool_name: [self.gpus_per_replica_node] * self.nnodes,
         }
+        # NCCL checkpoint engine assigns one collective rank per rollout worker.
+        # max_colocate_count>1 shares a GPU across workers and breaks NCCL setup.
+        checkpoint_backend = getattr(getattr(self.config, "checkpoint_engine", None), "backend", None)
+        max_colocate_count = 1 if checkpoint_backend == "nccl" else 2
         resource_pool_manager = ResourcePoolManager(
             resource_pool_spec=resource_pool_spec,
             mapping=None,
-            max_colocate_count=2,
+            max_colocate_count=max_colocate_count,
         )
         resource_pool_manager.create_resource_pool()
         self.resource_pool = resource_pool_manager.resource_pool_dict[resource_pool_name]

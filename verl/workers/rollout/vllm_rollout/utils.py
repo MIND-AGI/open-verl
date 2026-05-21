@@ -50,8 +50,12 @@ def set_death_signal():
         os.kill(os.getpid(), signal.SIGKILL)
 
 
-def get_device_uuid(device_id: int) -> str:
+def get_device_uuid(device_id: str | int) -> str:
     from vllm.platforms import current_platform
+
+    # Ray may report accelerator ids as strings (for example "0").
+    # vLLM expects an integer index into CUDA_VISIBLE_DEVICES.
+    device_id = int(device_id)
 
     # Convert torch.npu.current_device to its corresponding ASCEND_RT_VISIBLE_DEVICES.
     if is_npu_available:
