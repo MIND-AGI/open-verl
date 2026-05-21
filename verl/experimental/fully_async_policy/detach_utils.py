@@ -345,6 +345,36 @@ class MetricsAggregator:
         }
 
 
+def _is_task_cancellation(exc: BaseException) -> bool:
+    """True when a task failed because rollout/training was aborted (not a root bug)."""
+    import concurrent.futures
+
+    if isinstance(exc, (asyncio.CancelledError, concurrent.futures.CancelledError)):
+        return True
+
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, (asyncio.CancelledError, concurrent.futures.CancelledError)):
+            return True
+        try:
+            import ray.exceptions as ray_exc
+
+            if isinstance(cur, ray_exc.TaskCancelledError):
+                return True
+            if isinstance(cur, ray_exc.RayTaskError):
+                cause = getattr(cur, "cause", None)
+                if isinstance(cause, (asyncio.CancelledError, concurrent.futures.CancelledError)):
+                    return True
+                if cause is not None and "CancelledError" in type(cause).__name__:
+                    return True
+        except ImportError:
+            pass
+        cur = cur.__cause__
+    return False
+
+
 def task_exception_handler(task: asyncio.Task):
     """Handle task exceptions and log them"""
     try:
@@ -352,6 +382,8 @@ def task_exception_handler(task: asyncio.Task):
     except asyncio.CancelledError:
         pass  # Task was cancelled, this is expected
     except Exception as e:
+        if _is_task_cancellation(e):
+            return
         print(f"Task {task.get_name()} failed with exception: {e}")
         raise e
 

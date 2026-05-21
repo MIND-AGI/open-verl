@@ -554,3 +554,52 @@ def apply_patch_megatron_recomputation_backward():
         return (None, None) + grads
 
     rd.CheckpointFunction.backward = patch_backward
+
+
+def apply_patch_attention_output_gate_tp():
+    """Fix output gate head partitioning when num_kv_heads < tp_size.
+
+    Qwen3.5 full-attention layers use attn_output_gate=True with num_key_value_heads=2.
+    Megatron indexes query heads per TP rank but leaves gate unindexed, so
+    gate.view(*x.shape) fails in _apply_output_gate (often surfaced via torch.compile).
+    """
+    from megatron.core import parallel_state
+    from megatron.core.transformer.attention import SelfAttention
+
+    if getattr(SelfAttention, "_verl_output_gate_tp_patched", False):
+        return
+
+    _orig = SelfAttention.get_query_key_value_tensors
+
+    def patched_get_query_key_value_tensors(
+        self,
+        hidden_states,
+        key_value_states=None,
+        output_gate=False,
+        split_qkv=True,
+    ):
+        result = _orig(
+            self,
+            hidden_states,
+            key_value_states,
+            output_gate=output_gate,
+            split_qkv=split_qkv,
+        )
+        if (
+            output_gate
+            and self.config.num_query_groups is not None
+            and self.config.num_query_groups < self.world_size
+            and len(result) == 4
+        ):
+            query, key, value, gate = result
+            tp_rank = parallel_state.get_tensor_model_parallel_rank()
+            idx = tp_rank % (self.world_size // self.config.num_query_groups)
+            size = self.num_attention_heads_per_partition // (
+                self.world_size // self.config.num_query_groups
+            )
+            gate = gate[:, :, idx * size : (idx + 1) * size, :]
+            return query, key, value, gate
+        return result
+
+    SelfAttention.get_query_key_value_tensors = patched_get_query_key_value_tensors
+    SelfAttention._verl_output_gate_tp_patched = True

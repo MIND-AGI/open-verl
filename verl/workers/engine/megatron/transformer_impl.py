@@ -124,8 +124,12 @@ class MegatronEngine(BaseEngine):
         from verl.utils.device import is_cuda_available
 
         if is_cuda_available:
-            from verl.models.mcore.patch import apply_patch_megatron_recomputation_backward
+            from verl.models.mcore.patch import (
+                apply_patch_attention_output_gate_tp,
+                apply_patch_megatron_recomputation_backward,
+            )
 
+            apply_patch_attention_output_gate_tp()
             apply_patch_megatron_recomputation_backward()
 
     def _init_device_mesh(self):

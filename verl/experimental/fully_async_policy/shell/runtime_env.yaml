@@ -1,4 +1,5 @@
 env_vars:
+  FLA_TILELANG: "1"
   VLLM_USE_V1: "1"
   NCCL_DEBUG: "WARN"
   NCCL_CUMEM_ENABLE: "0"
