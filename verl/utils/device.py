@@ -74,16 +74,18 @@ def get_device_name() -> str:
     Detects the available accelerator and returns the corresponding PyTorch
     device type string. Currently supports CUDA, Ascend NPU, and CPU.
 
+    Uses a runtime check (not the module-level ``is_cuda_available`` cache) so
+    Ray workers that import verl before ``CUDA_VISIBLE_DEVICES`` is set still
+    see the GPU assigned to the worker.
+
     Returns:
         str: Device type string ('cuda', 'npu', or 'cpu').
     """
-    if is_cuda_available:
-        device = "cuda"
-    elif is_npu_available:
-        device = "npu"
-    else:
-        device = "cpu"
-    return device
+    if torch.cuda.is_available():
+        return "cuda"
+    if is_torch_npu_available():
+        return "npu"
+    return "cpu"
 
 
 def get_torch_device():

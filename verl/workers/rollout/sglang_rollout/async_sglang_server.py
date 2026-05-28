@@ -57,6 +57,38 @@ logger.setLevel(logging.INFO)
 
 visible_devices_keyword = get_visible_devices_keyword()
 
+# Keys propagated to SGLangHttpServer actors (Ray only passed NOSET_CUDA before).
+_SGLANG_SERVER_ENV_KEYS = (
+    "PATH",
+    "CC",
+    "CXX",
+    "FLASHINFER_NVCC",
+    "FLASHINFER_EXTRA_CUDAFLAGS",
+    "CPATH",
+    "C_INCLUDE_PATH",
+    "CPLUS_INCLUDE_PATH",
+    "CUDA_HOME",
+    "CUDA_PATH",
+    "LD_LIBRARY_PATH",
+    "HOME",
+    "HF_HOME",
+    "HF_DATASETS_CACHE",
+    "HUGGINGFACE_HUB_CACHE",
+    "VLLM_CACHE_ROOT",
+    "VLLM_CONFIG_ROOT",
+    "NCCL_SOCKET_IFNAME",
+    "GLOO_SOCKET_IFNAME",
+)
+
+
+def _sglang_http_server_runtime_env() -> dict:
+    env_vars = {f"RAY_EXPERIMENTAL_NOSET_{visible_devices_keyword}": "1"}
+    for key in _SGLANG_SERVER_ENV_KEYS:
+        val = os.environ.get(key)
+        if val:
+            env_vars[key] = val
+    return {"env_vars": env_vars}
+
 
 def _extract_prompt_logprobs_sglang(
     meta_info: dict,
@@ -773,7 +805,7 @@ class SGLangReplica(RolloutReplica):
                     node_id=node_id,
                     soft=False,
                 ),
-                runtime_env={"env_vars": {f"RAY_EXPERIMENTAL_NOSET_{visible_devices_keyword}": "1"}},
+                runtime_env=_sglang_http_server_runtime_env(),
                 name=name,
                 max_concurrency=self.max_concurrency,
             ).remote(

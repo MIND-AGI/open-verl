@@ -218,10 +218,13 @@ class RolloutReplica(ABC):
             name_prefix = f"rollout_teacher_standalone_{self.replica_rank}{self.name_suffix}"
         else:
             name_prefix = f"rollout_standalone_{self.replica_rank}{self.name_suffix}"
+        # STRICT_PACK keeps the full replica on one node. bin_pack=False (PACK) can
+        # spread bundles across nodes and colocate SGLang with the FSDP trainer on
+        # small (e.g. 2-node) clusters → GPU OOM / actor death.
         worker_group = RayWorkerGroup(
             resource_pool=self.resource_pool,
             ray_cls_with_init=self.get_ray_class_with_init_args(),
-            bin_pack=False,
+            bin_pack=True,
             name_prefix=name_prefix,
             use_gpu=True,
             device_name="cuda" if not is_torch_npu_available(check_device=False) else "npu",

@@ -56,7 +56,18 @@ def create_resource_pool_manager(config, roles: list) -> ResourcePoolManager:
         assert rm_cfg.n_gpus_per_node > 0, "config.reward.reward_model.n_gpus_per_node must be greater than 0"
         assert rm_cfg.nnodes > 0, "config.reward.reward_model.nnodes must be greater than 0"
 
-    return ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
+    # FSDP trainer workers must reserve whole GPUs (max_colocate_count=1). The default
+    # value of 3 assigns num_gpus=1/3 per worker, so Ray still sees free GPU capacity on
+    # the trainer node and may schedule standalone SGLang rollout there → GPU conflict.
+    actor_strategy = getattr(getattr(config, "actor_rollout_ref", None), "actor", None)
+    strategy = getattr(actor_strategy, "strategy", "") if actor_strategy is not None else ""
+    max_colocate_count = 1 if strategy in ("fsdp", "fsdp2") else 3
+
+    return ResourcePoolManager(
+        resource_pool_spec=resource_pool_spec,
+        mapping=mapping,
+        max_colocate_count=max_colocate_count,
+    )
 
 
 def create_role_worker_mapping(config):
