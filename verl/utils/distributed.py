@@ -112,10 +112,18 @@ def stateless_init_process_group(master_address, master_port, rank, world_size, 
     # from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
     # from sglang.srt.distributed.utils import statelessprocessgroup
 
+    import dataclasses as _dataclasses
+
     from torch.distributed import TCPStore
     from vllm.distributed.utils import StatelessProcessGroup
 
     from verl.utils.device import is_npu_available
+
+    # vllm <=0.14 dataclass has a `socket` field (anchors python wrapper alive);
+    # vllm >=0.19 removed it and transfers fd ownership via .detach() instead.
+    _spg_has_socket_field = any(
+        f.name == "socket" for f in _dataclasses.fields(StatelessProcessGroup)
+    )
 
     if is_npu_available:
         from vllm_ascend.distributed.device_communicators.pyhccl import PyHcclCommunicator as PyNcclCommunicator
@@ -145,7 +153,11 @@ def stateless_init_process_group(master_address, master_port, rank, world_size, 
             listen_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             listen_socket.bind(bind_addr)
             listen_socket.listen()
-            listen_fd = listen_socket.fileno()
+            if _spg_has_socket_field:
+                listen_fd = listen_socket.fileno()
+            else:
+                # vllm 0.19+: TCPStore takes fd ownership; python wrapper releases it.
+                listen_fd = listen_socket.detach()
         else:
             listen_socket = None
             listen_fd = None
@@ -160,13 +172,15 @@ def stateless_init_process_group(master_address, master_port, rank, world_size, 
             master_listen_fd=listen_fd,
         )
 
-        return StatelessProcessGroup(
+        spg_kwargs = dict(
             rank=rank,
             world_size=world_size,
             store=store,
-            socket=listen_socket,
             data_expiration_seconds=data_expiration_seconds,
         )
+        if _spg_has_socket_field:
+            spg_kwargs["socket"] = listen_socket
+        return StatelessProcessGroup(**spg_kwargs)
 
     pg = create_process_group(host=master_address, port=master_port, rank=rank, world_size=world_size)
 
