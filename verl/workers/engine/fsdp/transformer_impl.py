@@ -784,7 +784,14 @@ class FSDPEngine(BaseEngine):
     def get_per_tensor_param(self, layered_summon=False, base_sync_done=False, **kwargs):
         log_gpu_memory_usage("Before load_fsdp_model_to_gpu", logger=logger)
 
-        load_fsdp_model_to_gpu(self.module)
+        # Only force the whole module onto GPU for manual offload (param_offload/optimizer_offload).
+        # When FSDP2 CPUOffloadPolicy is active, offload_policy forces _is_offload_param=False and the
+        # params are CPU-resident DTensors; moving the module with model.to(cuda) here leaves them in a
+        # cpu-metadata/cuda-storage state that breaks state_dict() under torch>=2.10 ("Attempted to set
+        # the storage ... devices must match"). The per-tensor path below already moves each DTensor to
+        # GPU via param.to(device).full_tensor(), so skip the eager load in that case.
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.module)
 
         log_gpu_memory_usage("After load_fsdp_model_to_gpu", logger=logger)
 
