@@ -292,7 +292,15 @@ class FSDPEngine(BaseEngine):
             module.to(torch_dtype)
 
             if self.model_config.enable_gradient_checkpointing:
-                module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+                # determinism_check="none": qwen3_moe's dynamic per-expert dispatch saves a
+                # data-dependent number of tensors, which the default non-reentrant
+                # checkpoint determinism check flags as "A different number of tensors was
+                # saved during the original forward and recomputation" -> CheckpointError.
+                # The recompute is still correct (routing is deterministic); skip the over-
+                # strict count check for MoE. (chenxianwei avoids this via use_torch_compile.)
+                module.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False, "determinism_check": "none"}
+                )
         return module
 
     def _build_lora_module(self, module):
@@ -747,8 +755,13 @@ class FSDPEngine(BaseEngine):
         """
         Save FSDP checkpoint, handling parameter offload as needed.
         """
-        origin_module_device = next(self.module.parameters()).device.type
-        if self._is_offload_param or origin_module_device == "cpu":
+        # Only onload for MANUAL offload (param_offload). Under FSDP2 CPUOffloadPolicy the
+        # params are CPU-resident DTensors and _is_offload_param is False; calling
+        # load_fsdp_model_to_gpu (model.to(cuda)) here would leave them in a cpu-metadata/
+        # cuda-storage state that breaks state_dict() on torch>=2.10 ("Attempted to set the
+        # storage ... devices must match"). The checkpoint manager handles CPU DTensors
+        # directly. Mirrors the guard in get_per_tensor_param / load_checkpoint.
+        if self._is_offload_param:
             load_fsdp_model_to_gpu(self.module)
 
         self.checkpoint_manager.save_checkpoint(

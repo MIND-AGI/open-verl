@@ -272,6 +272,18 @@ class TaskRunner:
         tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
         # Used for multimodal LLM, could be None
         processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
+        # Some text-only models (e.g. Qwen3.5-MoE-Base) register a multimodal processor via
+        # trust_remote_code (Qwen3VLProcessor, has image_processor) that LACKS a chat_template,
+        # while the tokenizer HAS one. Preferring such a processor makes RLHFDataset's
+        # apply_chat_template raise "this processor does not have a chat template". A genuine
+        # multimodal processor always ships a chat_template, so when it doesn't but the tokenizer
+        # does, the processor is spurious for text use -> drop it and use the tokenizer.
+        if (
+            processor is not None
+            and getattr(processor, "chat_template", None) is None
+            and getattr(tokenizer, "chat_template", None) is not None
+        ):
+            processor = None
 
         resource_pool_manager = self.init_resource_pool_mgr(config)
 

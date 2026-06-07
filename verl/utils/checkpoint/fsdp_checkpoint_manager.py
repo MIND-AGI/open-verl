@@ -222,6 +222,9 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         # every rank will save its own model and optim shard
         state_dict_cfg = ShardedStateDictConfig(offload_to_cpu=True if is_cuda_available else False)
         optim_cfg = ShardedOptimStateDictConfig(offload_to_cpu=True if is_cuda_available else False)
+        # NOTE: under FSDP2 CPUOffloadPolicy the params must stay CPU-resident DTensors here
+        # (the engine's save_checkpoint must NOT load_fsdp_model_to_gpu first) — raw
+        # state_dict() then works on torch>=2.10. See transformer_impl.save_checkpoint guard.
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             with get_fsdp_state_ctx(self.model, StateDictType.SHARDED_STATE_DICT, state_dict_cfg, optim_cfg):
